@@ -38,7 +38,10 @@ public class SkykingsBridgeClient implements ClientModInitializer {
 
 	// Hypixel puts color codes like §2 inside the text itself, so they have to be removed before reading it.
 	private static final Pattern COLOR_CODES = Pattern.compile("\u00A7.?");
+	// Hypixel adds this as an extra line to any chat message that mentions Discord.
 	private static final String DISCORD_WARNING = "Please be mindful of Discord links in chat";
+	// Removes whatever is left at the end after cutting the warning off: spaces, line breaks, color codes.
+	private static final Pattern TRAILING_JUNK = Pattern.compile("(\\s|\u00A7.)+$");
 
 	private static SkykingsBridgeClient instance;
 
@@ -69,9 +72,19 @@ public class SkykingsBridgeClient implements ClientModInitializer {
 			restart();
 		});
 
-		// Hide Hypixel's Discord-link warning. This only affects your own screen.
-		ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) ->
-			!stripColors(message.getString()).contains(DISCORD_WARNING));
+		// Hypixel's Discord warning is added to the same message as the chat line that triggered it,
+		// so only the warning is cut off and the message itself still shows. This only affects your own screen.
+		ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) -> {
+			String text = message.getString();
+			// Hide a message only if the warning is all there is in it.
+			return !hasDiscordWarning(text) || !stripColors(withoutDiscordWarning(text)).isEmpty();
+		});
+		ClientReceiveMessageEvents.MODIFY_GAME.register((message, overlay) -> {
+			String text = message.getString();
+			if (!hasDiscordWarning(text)) return message; // every other message stays exactly as it was
+			// Hypixel's colors are § codes inside the text, so the rest of the message keeps its colors.
+			return Component.literal(withoutDiscordWarning(text));
+		});
 	}
 
 	/** Called after the config screen saves, so new settings take effect right away. */
@@ -90,8 +103,9 @@ public class SkykingsBridgeClient implements ClientModInitializer {
 	}
 
 	private void onChatLine(String rawText) {
-		// e.g. "§2Guild > §6[MVP§9++§6] Name §e[E]§f: hi" becomes "Guild > [MVP++] Name [E]: hi"
-		String text = stripColors(rawText);
+		// e.g. "§2Guild > §6[MVP§9++§6] Name §e[E]§f: hi" becomes "Guild > [MVP++] Name [E]: hi".
+		// The Discord warning is removed, and any line breaks become spaces.
+		String text = stripColors(withoutDiscordWarning(rawText)).replace('\n', ' ');
 		if (!text.startsWith("Guild > ")) return;
 		// Every guild line (messages, joins, leaves) goes to bot.py, which formats it for Discord.
 		// Everyone with the mod sends the same lines; bot.py posts each one only once.
@@ -279,6 +293,18 @@ public class SkykingsBridgeClient implements ClientModInitializer {
 
 	private static String stripColors(String text) {
 		return COLOR_CODES.matcher(text).replaceAll("").trim();
+	}
+
+	private static boolean hasDiscordWarning(String text) {
+		return stripColors(text).contains(DISCORD_WARNING);
+	}
+
+	/** Cuts Hypixel's Discord warning off the end of a message, keeping everything before it. */
+	private static String withoutDiscordWarning(String text) {
+		if (!hasDiscordWarning(text)) return text;
+		int start = text.lastIndexOf("Please be mindful of");
+		if (start < 0) return text;
+		return TRAILING_JUNK.matcher(text.substring(0, start)).replaceAll("");
 	}
 
 	/**
