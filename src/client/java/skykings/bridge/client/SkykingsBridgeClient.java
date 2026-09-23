@@ -1,292 +1,301 @@
 package skykings.bridge.client;
 
 import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
-import net.fabricmc.loader.api.FabricLoader;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.time.Duration;
 import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Pattern;
 
+/**
+ * Client-side Fabric mod that bridges Hypixel guild chat and a Discord channel through bot.py.
+ *
+ *   Guild chat -> Discord: every player with the mod sends the guild lines they see, and bot.py
+ *   posts each line once. As long as one of them can see guild chat, nothing is missed.
+ *
+ *   Discord -> game: bot.py sends each Discord message to every player with the mod, and the mod
+ *   shows it in that player's own chat. Nothing is typed into guild chat, so only mod users see it.
+ */
 public class SkykingsBridgeClient implements ClientModInitializer {
+	private static final Logger LOG = LoggerFactory.getLogger("SkykingsBridge");
+	private static final Gson GSON = new Gson();
 
-	// Built into the jar so other players need zero setup. Edit these two, then rebuild.
-	private static final String DEFAULT_URL = "wss://l3nnyxserver.taile3f3bc.ts.net/ws";
-	private static final String DEFAULT_SECRET = "176a5776329a3d65f11496977fc6218b"; // your WS_SECRET from the server
+	// Hypixel puts color codes like §2 inside the text itself, so they have to be removed before reading it.
+	private static final Pattern COLOR_CODES = Pattern.compile("\u00A7.?");
+	private static final String DISCORD_WARNING = "Please be mindful of Discord links in chat";
 
-	/** Written to .minecraft/config/dcbridge.json. Leave url/secret empty to use the built-in defaults. */
-	public static class Config {
-		public String url = "";
-		public String secret = "";
-		/** Regexes matched against Hypixel's chat lines when you toggle guild chat. Empty = unused. */
-		public String guildToggleOffRegex = "";
-		public String guildToggleOnRegex = "";
-		public boolean onlyOnHypixel = true;
-	}
+	private static SkykingsBridgeClient instance;
 
-	private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-	private static final ScheduledExecutorService POOL = Executors.newSingleThreadScheduledExecutor(r -> {
-		Thread t = new Thread(r, "dcbridge");
-		t.setDaemon(true);
-		return t;
-	});
-
-	private Config cfg;
-	private Pattern offPattern;
-	private Pattern onPattern;
+	private final HttpClient http = HttpClient.newHttpClient();
+	private final ScheduledExecutorService timer = Executors.newSingleThreadScheduledExecutor(daemon("SkykingsBridge-timer"));
+	private final ExecutorService sendThread = Executors.newSingleThreadExecutor(daemon("SkykingsBridge-send"));
+	// Goes up on every (re)connect. Callbacks from an older connection see an old number and do nothing.
+	private final AtomicInteger generation = new AtomicInteger();
 
 	private volatile WebSocket socket;
-	private volatile boolean ready = false;
-	/** false when the player has Hypixel's guild chat toggled off -> hide Discord messages, relay nothing. */
-	private volatile boolean guildChatOn = true;
-	private final AtomicBoolean reconnecting = new AtomicBoolean(false);
-	private volatile int backoffSeconds = 2;
-	/** Set by the bot: only one connected player relays guild chat. */
-	private volatile boolean isRelayer = false;
+	private volatile boolean inServer;
+	private volatile String playerName = "";
+	private volatile int retryDelaySec = 2;
 
 	@Override
 	public void onInitializeClient() {
-		loadConfig();
+		instance = this;
+		BridgeConfig.HANDLER.load(); // reads config/skykings-bridge.json5, creating it on first launch
 
-		// Lines coming from the server (Hypixel sends chat as system/game messages).
-		INSTANCE = this;
-		// Chat lines are read by ChatComponentMixin (after other mods like SkyHanni are done with them).
-
-		// Commands typed by the player.
-		ClientSendMessageEvents.ALLOW_COMMAND.register(command -> {
-			String c = command.trim().toLowerCase();
-			if (c.startsWith("dcbridge")) {
-				handleOwnCommand(c);
-				return false; // don't send to the server
-			}
-			// Fallback only when no confirmation regexes are configured.
-			if (offPattern == null && onPattern == null
-				&& (c.equals("gtoggle") || c.equals("g toggle") || c.equals("guild toggle"))) {
-				guildChatOn = !guildChatOn;
-				info("Discord bridge assumes guild chat is now " + (guildChatOn ? "ON" : "OFF")
-					+ " (use /dcbridge guild on|off to correct)");
-			}
-			return true;
+		// Tie the connection to the game session: connect on join, disconnect on leave.
+		ClientPlayConnectionEvents.JOIN.register((handler, packetSender, client) -> {
+			inServer = true;
+			if (client.player != null) playerName = client.player.getGameProfile().name();
+			if (socket == null) restart(); // already connected (e.g. switching lobbies)? keep it
+		});
+		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+			inServer = false;
+			restart();
 		});
 
-		connect();
+		// Hide Hypixel's Discord-link warning. This only affects your own screen.
+		ClientReceiveMessageEvents.ALLOW_GAME.register((message, overlay) ->
+			!stripColors(message.getString()).contains(DISCORD_WARNING));
 	}
 
-	private static SkykingsBridgeClient INSTANCE;
+	/** Called after the config screen saves, so new settings take effect right away. */
+	public static void applyConfig() {
+		if (instance != null) instance.restart();
+	}
 
-	/** Called by ChatComponentMixin for every line shown in chat. */
+	// ---------- Guild chat -> Discord ----------
+
+	/**
+	 * Called by ChatPacketMixin for every chat line Hypixel sends (action-bar text is skipped there).
+	 * Reading the packet directly means other chat mods can't hide or reformat guild chat before we see it.
+	 */
 	public static void onDisplayedLine(String text) {
-		if (INSTANCE != null) INSTANCE.onChatLine(text);
+		if (instance != null) instance.onChatLine(text);
 	}
 
-	private void onChatLine(String raw) {
-		// Strip invisible/format characters and anything other mods put before "Guild >"
-		String text = raw.replaceAll("[\\p{Cf}\\p{Co}\\u00A0]", " ").strip();
-
-		if (offPattern != null && offPattern.matcher(text).find()) guildChatOn = false;
-		if (onPattern != null && onPattern.matcher(text).find()) guildChatOn = true;
-
-		int i = text.indexOf("Guild > ");
-		if (i >= 0 && i <= 6) {
-			text = text.substring(i);
-			guildChatOn = true; // we can see guild chat, so it's obviously on
-			relayGuildLine(text);
-		} else if (text.contains("Guild")) {
-			log("Saw a Guild line but didn't match: " + raw.chars()
-				.limit(20).mapToObj(c -> Integer.toHexString(c)).toList() + " | " + raw);
-		}
+	private void onChatLine(String rawText) {
+		// e.g. "§2Guild > §6[MVP§9++§6] Name §e[E]§f: hi" becomes "Guild > [MVP++] Name [E]: hi"
+		String text = stripColors(rawText);
+		if (!text.startsWith("Guild > ")) return;
+		// Every guild line (messages, joins, leaves) goes to bot.py, which formats it for Discord.
+		// Everyone with the mod sends the same lines; bot.py posts each one only once.
+		JsonObject o = new JsonObject();
+		o.addProperty("type", "guild");
+		o.addProperty("text", text);
+		send(o);
 	}
 
-	// ---------------------------------------------------------------- config
+	// ---------- Discord -> game ----------
 
-	private void loadConfig() {
-		Path p = FabricLoader.getInstance().getConfigDir().resolve("dcbridge.json");
-		try {
-			if (!Files.exists(p)) Files.writeString(p, GSON.toJson(new Config()));
-			cfg = GSON.fromJson(Files.readString(p), Config.class);
-		} catch (Exception e) {
-			System.err.println("[dcbridge] config error: " + e);
-			cfg = new Config();
-		}
-		if (cfg.url == null || cfg.url.isBlank()) cfg.url = DEFAULT_URL;
-		if (cfg.secret == null || cfg.secret.isBlank()) cfg.secret = DEFAULT_SECRET;
-		offPattern = cfg.guildToggleOffRegex.isBlank() ? null : Pattern.compile(cfg.guildToggleOffRegex);
-		onPattern = cfg.guildToggleOnRegex.isBlank() ? null : Pattern.compile(cfg.guildToggleOnRegex);
+	/** Shows a Discord message in this player's own chat, e.g. "Discord > Dana: hello". */
+	private void showDiscordMessage(String author, String text) {
+		Component line = Component.literal("Discord > ").withStyle(ChatFormatting.BLUE)
+			.append(Component.literal(author).withStyle(ChatFormatting.AQUA))
+			.append(Component.literal(": " + text).withStyle(ChatFormatting.WHITE));
+		Minecraft mc = Minecraft.getInstance();
+		// Network threads must never touch the game directly, so hop onto the game thread.
+		// sendSystemMessage only adds the line to your own chat; nothing is sent to the server.
+		mc.execute(() -> {
+			if (mc.player != null) mc.player.sendSystemMessage(line);
+		});
 	}
 
-	// ------------------------------------------------------------- websocket
+	// ---------- Connection ----------
 
-	private void connect() {
-		if ("PUT_SECRET_HERE".equals(cfg.secret)) {
-			log("No secret set: edit DEFAULT_SECRET in the source and rebuild.");
+	/** Drop the current connection (if any), then connect again if we should be connected. */
+	private synchronized void restart() {
+		int gen = generation.incrementAndGet();
+		WebSocket old = socket;
+		socket = null;
+		// Close through the send thread, so anything already queued goes out first.
+		if (old != null) sendThread.execute(() -> {
+			try {
+				old.sendClose(WebSocket.NORMAL_CLOSURE, "").get(5, TimeUnit.SECONDS);
+			} catch (Exception ignored) {
+				// the connection was already broken, abort() cleans up
+			}
+			old.abort();
+		});
+		retryDelaySec = 2;
+		if (inServer) connect(gen);
+	}
+
+	private void connect(int gen) {
+		BridgeConfig cfg = BridgeConfig.get();
+		if (!cfg.enabled) return;
+		// Uses the config file's values if filled in, otherwise the ones built into the jar.
+		// The values themselves are never logged, so they don't end up in anyone's latest.log.
+		String url = cfg.effectiveServerUrl();
+		String secret = cfg.effectiveSecret();
+		if (url.isEmpty() || secret.isEmpty()) {
+			LOG.warn("No server URL or key set (none built into the mod, none in config/skykings-bridge.json5), not connecting");
 			return;
 		}
-		log("Connecting to " + cfg.url + " (secret length " + cfg.secret.length() + ")");
+		URI uri;
 		try {
-			HttpClient.newHttpClient()
-				.newWebSocketBuilder()
-				.connectTimeout(Duration.ofSeconds(10))
-				.buildAsync(URI.create(cfg.url), new Listener())
-				.whenComplete((ws, err) -> {
-					if (err != null) {
-						log("Connect failed: " + err);
-						scheduleReconnect();
-					}
-				});
-		} catch (Exception e) {
-			log("Connect error: " + e);
-			scheduleReconnect();
+			uri = URI.create(url);
+		} catch (IllegalArgumentException e) {
+			LOG.warn("The server URL is not a valid address");
+			return;
 		}
+		if (!"ws".equalsIgnoreCase(uri.getScheme()) && !"wss".equalsIgnoreCase(uri.getScheme())) {
+			LOG.warn("The server URL must start with ws:// or wss://");
+			return;
+		}
+		http.newWebSocketBuilder()
+			.buildAsync(uri, new Listener(gen, secret))
+			.exceptionally(error -> {
+				retryLater(gen);
+				return null;
+			});
 	}
 
-	private void scheduleReconnect() {
-		ready = false;
-		isRelayer = false;
-		socket = null;
-		if (!reconnecting.compareAndSet(false, true)) return;
-		int delay = backoffSeconds;
-		backoffSeconds = Math.min(backoffSeconds * 2, 60);
-		POOL.schedule(() -> {
-			reconnecting.set(false);
-			connect();
+	private void retryLater(int gen) {
+		if (gen != generation.get()) return; // this connection was already replaced
+		int delay = retryDelaySec;
+		retryDelaySec = Math.min(delay * 2, 60); // exponential backoff, max 60s
+		LOG.info("Bridge disconnected, retrying in {}s", delay);
+		timer.schedule(() -> {
+			if (gen == generation.get()) connect(gen);
 		}, delay, TimeUnit.SECONDS);
 	}
 
 	private class Listener implements WebSocket.Listener {
-		private final StringBuilder buf = new StringBuilder();
+		private final int gen;
+		private final String secret;
+		private final StringBuilder buffer = new StringBuilder();
+
+		Listener(int gen, String secret) {
+			this.gen = gen;
+			this.secret = secret;
+		}
 
 		@Override
 		public void onOpen(WebSocket ws) {
-			log("Socket open, sending auth");
-			socket = ws;
-			JsonObject auth = new JsonObject();
-			auth.addProperty("type", "auth");
-			auth.addProperty("secret", cfg.secret);
-			ws.sendText(GSON.toJson(auth), true);
+			synchronized (SkykingsBridgeClient.this) {
+				if (gen != generation.get()) { // settings changed while we were connecting
+					ws.abort();
+					return;
+				}
+				JsonObject auth = new JsonObject();
+				auth.addProperty("type", "auth");
+				auth.addProperty("secret", secret);
+				auth.addProperty("name", playerName);
+				queueSend(ws, GSON.toJson(auth)); // queued before anything else, so it's always first
+				socket = ws;
+			}
+			retryDelaySec = 2;
+			LOG.info("Connected to relay server, sending secret");
 			ws.request(1);
 		}
 
 		@Override
 		public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
-			buf.append(data);
+			buffer.append(data); // big messages can arrive in pieces
 			if (last) {
-				String s = buf.toString();
-				buf.setLength(0);
-				handleMessage(s);
+				handle(buffer.toString());
+				buffer.setLength(0);
 			}
-			ws.request(1);
+			ws.request(1); // ask for the next piece
 			return null;
 		}
 
 		@Override
 		public CompletionStage<?> onClose(WebSocket ws, int code, String reason) {
-			log("Closed by server: " + code + " " + reason);
-			scheduleReconnect();
+			closed(ws, code, reason);
 			return null;
 		}
 
 		@Override
 		public void onError(WebSocket ws, Throwable error) {
-			log("Socket error: " + error);
-			scheduleReconnect();
+			closed(ws, -1, String.valueOf(error));
 		}
-	}
 
-	private void handleMessage(String json) {
-		try {
-			JsonObject o = JsonParser.parseString(json).getAsJsonObject();
-			String type = o.get("type").getAsString();
-			if (type.equals("ready")) {
-				ready = true;
-				log("Authenticated, bridge ready");
-				backoffSeconds = 2;
-				info("Discord bridge connected");
-			} else if (type.equals("role")) {
-				isRelayer = o.get("relay").getAsBoolean();
-				log("Relayer: " + isRelayer);
-			} else if (type.equals("discord")) {
-				if (!guildChatOn) return; // guild chat toggled off -> no messages
-				String author = o.get("author").getAsString().replace('§', ' ');
-				String text = o.get("text").getAsString().replace('§', ' ');
-				Component line = Component.literal("[Discord] ").withStyle(ChatFormatting.BLUE)
-					.append(Component.literal(author + ": ").withStyle(ChatFormatting.AQUA))
-					.append(Component.literal(text).withStyle(ChatFormatting.WHITE));
-				show(line);
+		private void closed(WebSocket ws, int code, String reason) {
+			if (socket == ws) socket = null;
+			if (code == 4001) { // wrong secret, retrying wouldn't help
+				LOG.warn("Relay server rejected the secret, not retrying");
+				return;
 			}
-		} catch (Exception ignored) {
-			// malformed frame
+			if (code == 4002) { // this account connected again, and the newer connection took over
+				LOG.warn("Replaced by a newer connection from this account, not retrying");
+				return;
+			}
+			retryLater(gen);
 		}
 	}
 
-	private void relayGuildLine(String text) {
+	// ---------- Sending and receiving ----------
+
+	private void send(JsonObject o) {
 		WebSocket ws = socket;
-		if (ws == null || !ready) { log("Not relaying (not connected): " + text); return; }
-		if (!guildChatOn) { log("Not relaying (guild chat marked off)"); return; }
-		if (!isRelayer) return; // another player is the relayer
-		if (cfg.onlyOnHypixel && !onHypixel()) { log("Not relaying (server is not hypixel.net)"); return; }
-		log("Relaying: " + text);
-		JsonObject o = new JsonObject();
-		o.addProperty("type", "guild");
-		o.addProperty("text", text);
-		String payload = GSON.toJson(o);
-		POOL.execute(() -> {
+		if (ws != null) queueSend(ws, GSON.toJson(o));
+	}
+
+	/** Java's WebSocket allows only one send at a time, so every send goes through one thread, in order. */
+	private void queueSend(WebSocket ws, String json) {
+		sendThread.execute(() -> {
 			try {
-				synchronized (this) {
-					ws.sendText(payload, true).join();
-				}
+				ws.sendText(json, true).get(10, TimeUnit.SECONDS);
 			} catch (Exception e) {
-				log("Send failed: " + e);
+				LOG.warn("Send failed: {}", e.toString());
 			}
 		});
 	}
 
-	// --------------------------------------------------------------- helpers
-
-	private boolean onHypixel() {
-		var server = Minecraft.getInstance().getCurrentServer();
-		return server != null && server.ip.toLowerCase().contains("hypixel.net");
-	}
-
-	private void show(Component c) {
-		Minecraft mc = Minecraft.getInstance();
-		mc.execute(() -> {
-			if (mc.level != null) mc.gui.getChat().addClientSystemMessage(c);
-		});
-	}
-
-	private static void log(String s) {
-		System.out.println("[dcbridge] " + s);
-	}
-
-	private void info(String s) {
-		show(Component.literal("[Discord bridge] " + s).withStyle(ChatFormatting.GRAY));
-	}
-
-	private void handleOwnCommand(String c) {
-		String[] a = c.split("\\s+");
-		if (a.length >= 3 && a[1].equals("guild")) {
-			guildChatOn = a[2].equals("on");
-			info("Guild chat marked " + (guildChatOn ? "ON" : "OFF"));
-		} else {
-			info((ready ? "connected" : "NOT connected") + (isRelayer ? " (relayer)" : "")
-				+ ", guild chat " + (guildChatOn ? "ON" : "OFF")
-				+ ". Commands: /dcbridge status | /dcbridge guild on|off");
+	private void handle(String json) {
+		try {
+			JsonObject o = GSON.fromJson(json, JsonObject.class);
+			if (o == null || !o.has("type")) return;
+			switch (o.get("type").getAsString()) {
+				case "ready" -> LOG.info("Relay server accepted the secret");
+				case "discord_display" -> {
+					String author = clean(o.get("author").getAsString(), 32);
+					String text = clean(o.get("text").getAsString(), 500);
+					if (!author.isEmpty() && !text.isEmpty()) showDiscordMessage(author, text);
+				}
+				default -> { }
+			}
+		} catch (RuntimeException e) {
+			LOG.warn("Ignoring bad message from relay server: {}", json);
 		}
+	}
+
+	private static String stripColors(String text) {
+		return COLOR_CODES.matcher(text).replaceAll("").trim();
+	}
+
+	/**
+	 * Removes line breaks, other control characters and the section sign from Discord messages.
+	 * The section sign would let Discord users add Minecraft colors or scrambled text to what you see.
+	 */
+	private static String clean(String s, int max) {
+		String cleaned = s.replaceAll("[\\p{Cntrl}\u00A7]", " ").replaceAll("\\s+", " ").trim();
+		return cleaned.length() > max ? cleaned.substring(0, max) : cleaned;
+	}
+
+	/** Background threads marked "daemon" so they never keep the game running after you quit. */
+	private static ThreadFactory daemon(String name) {
+		return runnable -> {
+			Thread thread = new Thread(runnable, name);
+			thread.setDaemon(true);
+			return thread;
+		};
 	}
 }

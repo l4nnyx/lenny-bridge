@@ -38,3 +38,13 @@ hs_err_*.log
 replay_*.log
 *.hprof
 *.jfr
+
+# bot secrets and Python files
+.env
+*.env
+__pycache__/
+*.pyc
+*.bak
+
+# built into the jar, only on my PC
+bridge-defaults.properties

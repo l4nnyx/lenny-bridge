@@ -3,27 +3,13 @@
 	"id": "skykings-bridge",
 	"version": "${version}",
 	"name": "skykings bridge",
-	"description": "This is an example description! Tell everyone what your mod is about!",
-	"authors": [
-		"Me!"
-	],
-	"contact": {
-		"homepage": "https://fabricmc.net/",
-		"sources": "https://github.com/FabricMC/fabric-example-mod"
-	},
-	"license": "CC0-1.0",
 	"icon": "assets/skykings-bridge/icon.png",
-	"environment": "*",
+	"environment": "client",
 	"entrypoints": {
-		"main": [
-			"skykings.bridge.SkykingsBridge"
-		],
-		"client": [
-			"skykings.bridge.client.SkykingsBridgeClient"
-		]
+		"client": ["skykings.bridge.client.SkykingsBridgeClient"],
+		"modmenu": ["skykings.bridge.client.ModMenuIntegration"]
 	},
 	"mixins": [
-		"skykings-bridge.mixins.json",
 		{
 			"config": "skykings-bridge.client.mixins.json",
 			"environment": "client"
@@ -33,6 +19,10 @@
 		"fabricloader": ">=0.19.5",
 		"minecraft": "~26.1.2",
 		"java": ">=25",
-		"fabric-api": "*"
+		"fabric-api": "*",
+		"yet_another_config_lib_v3": "*"
+	},
+	"suggests": {
+		"modmenu": "*"
 	}
 }
